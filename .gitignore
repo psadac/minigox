@@ -1,0 +1,11 @@
+# Output directory for cross-compiled binaries
+bin/
+
+# Compiled binary of this tool
+/minigox
+
+# Go build cache / test artifacts
+*.test
+*.out
+
+.idea
