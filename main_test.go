@@ -111,7 +111,7 @@ func testConfig(t *testing.T, srcDir, outDir string) *Config {
 	}
 	return &Config{
 		goCmd:   "go",
-		goCache: cache,
+		goVars:  EnvVars{"GOCACHE": cache},
 		homeDir: "/home/test",
 		srcDir:  srcDir,
 		outDir:  outDir,
@@ -121,7 +121,7 @@ func testConfig(t *testing.T, srcDir, outDir string) *Config {
 
 func TestSafeEnv(t *testing.T) {
 	c := &Config{
-		goCache: "testcache",
+		goVars:  EnvVars{"GOCACHE": "testcache"},
 		homeDir: "/home/test",
 	}
 	env := c.safeEnv(Platform{OS: "linux", Arch: "arm64"})

@@ -16,6 +16,16 @@ import (
 // EnvVars represents a collection of environment variables as key-value pairs.
 type EnvVars map[string]string
 
+func (ev *EnvVars) StringArray() []string {
+	sa := make([]string, 0, len(*ev))
+
+	for k, v := range *ev {
+		sa = append(sa, k+"="+v)
+	}
+
+	return sa
+}
+
 // Platform is a target platform for cross-compilation.
 type Platform struct {
 	OS   string `json:"GOOS"`
@@ -31,7 +41,6 @@ func (p Platform) String() string {
 type Config struct {
 	goCmd           string
 	goVars          EnvVars
-	goCache         string
 	homeDir         string
 	srcDir          string
 	outDir          string
@@ -86,7 +95,7 @@ func NewConfig(srcDir, outDir, platformInclude, platformExclude string) (*Config
 		nbErrors:        atomic.Uint32{},
 	}
 
-	err = c.listGoVars()
+	err = c.getGoVars("GOCACHE", "GOVERSION")
 	if err != nil {
 		return nil, fmt.Errorf("error: failed to determine go env variables: %v\n", err)
 	}
@@ -145,6 +154,16 @@ func matchAny(p Platform, patterns []string) bool {
 	return false
 }
 
+func (c *Config) String() string {
+	return fmt.Sprintf(`
+  Source dir : %s
+  Output dir : %s
+  Platforms  : %d
+  Workers    : %d
+  Go vars    : %v
+`, c.srcDir, c.outDir, len(c.platforms), c.maxWorkers, c.goVars.StringArray())
+}
+
 // buildAll cross-compiles for all configured platforms in parallel.
 func (c *Config) buildAll() error {
 	err := os.MkdirAll(c.outDir, 0o755)
@@ -161,13 +180,10 @@ func (c *Config) buildAll() error {
 
 	fmt.Printf(`
 Configuration:
-  Source dir : %s
-  Output dir : %s
-  Platforms  : %d
-  Workers    : %d
-
+%s
 Starting cross-compilation:
-`, c.srcDir, c.outDir, len(c.platforms), c.maxWorkers)
+
+`, c.String())
 
 	workersCh := make(chan struct{}, c.maxWorkers)
 	var wg sync.WaitGroup
@@ -194,6 +210,7 @@ Starting cross-compilation:
 	n := int(c.nbErrors.Load())
 	fmt.Printf(`
 Results:
+
   ok     : %d
   errors : %d
 
@@ -206,7 +223,8 @@ Results:
 	return nil
 }
 
-func (c *Config) listGoVars() error {
+// getGoVars retrieves Go environment variables in JSON format, parses them, and updates the Config with relevant values.
+func (c *Config) getGoVars(keys ...string) error {
 	out, err := exec.Command(c.goCmd, "env", "-json").Output()
 	if err != nil {
 		return fmt.Errorf("failed running go env: %w", err)
@@ -218,8 +236,11 @@ func (c *Config) listGoVars() error {
 		return fmt.Errorf("failed parsing go env output: %w", err)
 	}
 
-	c.goVars = ev
-	c.goCache = ev["GOCACHE"]
+	c.goVars = make(EnvVars)
+	for _, k := range keys {
+		c.goVars[k] = ev[k]
+	}
+
 	return nil
 }
 
@@ -242,9 +263,10 @@ func (c *Config) safeEnv(p Platform) []string {
 		"CGO_ENABLED=0",
 		"GOOS=" + p.OS,
 		"GOARCH=" + p.Arch,
-		"GOCACHE=" + c.goCache,
 		"HOME=" + c.homeDir,
 	}
+
+	env = append(env, c.goVars.StringArray()...)
 
 	return env
 }
