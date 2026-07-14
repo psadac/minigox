@@ -13,23 +13,8 @@ import (
 	"sync/atomic"
 )
 
-// goCmd is set at init time to a resolved absolute path, preventing PATH
-// hijacking between the platform-list and build steps.
-var goCmd string
-
-func init() {
-	var err error
-	goCmd, err = exec.LookPath("go")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: go binary not found in PATH: %v\n", err)
-		os.Exit(2)
-	}
-	goCmd, err = filepath.Abs(goCmd)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: cannot resolve go binary path: %v\n", err)
-		os.Exit(2)
-	}
-}
+// EnvVars represents a collection of environment variables as key-value pairs.
+type EnvVars map[string]string
 
 // Platform is a target platform for cross-compilation.
 type Platform struct {
@@ -44,17 +29,36 @@ func (p Platform) String() string {
 
 // Config holds the configuration for a cross-compilation run.
 type Config struct {
-	srcDir     string
-	outDir     string
-	appName    string
-	platforms  []Platform
-	maxWorkers int
-	nbErrors   atomic.Uint32
+	goCmd           string
+	goVars          EnvVars
+	goCache         string
+	homeDir         string
+	srcDir          string
+	outDir          string
+	appName         string
+	platformInclude string
+	platformExclude string
+	platforms       []Platform
+	maxWorkers      int
+	nbErrors        atomic.Uint32
 }
 
 // NewConfig builds a Config, validating directories and selecting platforms
 // from include/exclude patterns.
 func NewConfig(srcDir, outDir, platformInclude, platformExclude string) (*Config, error) {
+	goCmd, err := exec.LookPath("go")
+	if err != nil {
+		return nil, fmt.Errorf("error: go binary not found in PATH: %v\n", err)
+	}
+	goCmd, err = filepath.Abs(goCmd)
+	if err != nil {
+		return nil, fmt.Errorf("error: cannot resolve go binary path: %v\n", err)
+	}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+
 	absSrcDir, err := filepath.Abs(srcDir)
 	if err != nil {
 		return nil, err
@@ -70,28 +74,29 @@ func NewConfig(srcDir, outDir, platformInclude, platformExclude string) (*Config
 		return nil, err
 	}
 
-	err = os.MkdirAll(absOutDir, 0o755)
-	if err != nil {
-		return nil, fmt.Errorf("cannot create output directory: %w", err)
+	c := &Config{
+		goCmd:           goCmd,
+		homeDir:         homeDir,
+		srcDir:          absSrcDir,
+		outDir:          absOutDir,
+		appName:         filepath.Base(absSrcDir),
+		platformInclude: platformInclude,
+		platformExclude: platformExclude,
+		maxWorkers:      max(2, runtime.NumCPU()-1),
+		nbErrors:        atomic.Uint32{},
 	}
 
-	platforms, err := listPlatforms()
+	err = c.listGoVars()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error: failed to determine go env variables: %v\n", err)
 	}
 
-	return &Config{
-		srcDir:     absSrcDir,
-		outDir:     absOutDir,
-		appName:    filepath.Base(absSrcDir),
-		maxWorkers: max(2, runtime.NumCPU()-1),
-		platforms:  filterPlatforms(platforms, platformInclude, platformExclude),
-	}, nil
+	return c, nil
 }
 
 // listPlatforms returns the platforms supported by the Go toolchain.
-func listPlatforms() ([]Platform, error) {
-	out, err := exec.Command(goCmd, "tool", "dist", "list", "-json").CombinedOutput()
+func (c *Config) listPlatforms() ([]Platform, error) {
+	out, err := exec.Command(c.goCmd, "tool", "dist", "list", "-json").CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("failed running go tool dist: %w", err)
 	}
@@ -107,36 +112,53 @@ func listPlatforms() ([]Platform, error) {
 
 // filterPlatforms selects platforms matching any include pattern and not
 // matching any exclude pattern. An empty include matches all platforms.
-func filterPlatforms(platforms []Platform, include, exclude string) []Platform {
-	includes := strings.Fields(include)
-	excludes := strings.Fields(exclude)
+func (c *Config) filterPlatforms(platforms []Platform) []Platform {
+	includes := strings.Fields(c.platformInclude)
+	excludes := strings.Fields(c.platformExclude)
 
 	var filtered []Platform
 	for _, p := range platforms {
-		if len(includes) > 0 && !matchAny(includes, p) {
+		if len(includes) > 0 && !matchAny(p, includes) {
 			continue
 		}
-		if matchAny(excludes, p) {
+
+		if matchAny(p, excludes) {
 			continue
 		}
+
 		filtered = append(filtered, p)
 	}
 
 	return filtered
 }
 
-func matchAny(patterns []string, p Platform) bool {
+// matchAny checks if the platform `p` matches any pattern in the `patterns` slice.
+// Returns true if a match is found, false otherwise. Patterns use filepath.Match syntax.
+func matchAny(p Platform, patterns []string) bool {
 	for _, pat := range patterns {
 		ok, err := filepath.Match(pat, p.String())
 		if err == nil && ok {
 			return true
 		}
 	}
+
 	return false
 }
 
 // buildAll cross-compiles for all configured platforms in parallel.
 func (c *Config) buildAll() error {
+	err := os.MkdirAll(c.outDir, 0o755)
+	if err != nil {
+		return fmt.Errorf("cannot create output directory: %w", err)
+	}
+
+	ps, err := c.listPlatforms()
+	if err != nil {
+		return err
+	}
+
+	c.platforms = c.filterPlatforms(ps)
+
 	fmt.Printf(`
 Configuration:
   Source dir : %s
@@ -184,23 +206,46 @@ Results:
 	return nil
 }
 
+func (c *Config) listGoVars() error {
+	out, err := exec.Command(c.goCmd, "env", "-json").Output()
+	if err != nil {
+		return fmt.Errorf("failed running go env: %w", err)
+	}
+
+	var ev EnvVars
+	err = json.Unmarshal(out, &ev)
+	if err != nil {
+		return fmt.Errorf("failed parsing go env output: %w", err)
+	}
+
+	c.goVars = ev
+	c.goCache = ev["GOCACHE"]
+	return nil
+}
+
+func goEnvCache(goCmd string) (string, error) {
+	out, err := exec.Command(goCmd, "env", "GOCACHE").Output()
+	if err != nil {
+		return "", fmt.Errorf("failed running go env GOCACHE: %w", err)
+	}
+	return strings.TrimRight(string(out), "\n"), nil
+}
+
 // safeEnv returns a minimal environment for the build command,
 // passing through only essential variables and explicitly setting
 // Go cross-compilation variables. This prevents injection attacks
 // via environment variables such as GOFLAGS, GOPATH, GOPROXY, or
 // GONOSUMCHECK.
-func safeEnv(goos, goarch string) []string {
+func (c *Config) safeEnv(p Platform) []string {
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
 		"CGO_ENABLED=0",
-		"GOOS=" + goos,
-		"GOARCH=" + goarch,
+		"GOOS=" + p.OS,
+		"GOARCH=" + p.Arch,
+		"GOCACHE=" + c.goCache,
+		"HOME=" + c.homeDir,
 	}
-	// HOME is needed for Go module cache; prefer the real home dir
-	// rather than trusting a potentially manipulated value.
-	if home, err := os.UserHomeDir(); err == nil {
-		env = append(env, "HOME="+home)
-	}
+
 	return env
 }
 
@@ -213,9 +258,9 @@ func (c *Config) buildPlatform(p Platform) error {
 
 	outputPath := filepath.Join(c.outDir, fmt.Sprintf("%s-%s-%s%s", c.appName, p.OS, p.Arch, ext))
 
-	cmd := exec.Command(goCmd, "build", "-o", outputPath, ".")
+	cmd := exec.Command(c.goCmd, "build", "-o", outputPath, ".")
 	cmd.Dir = c.srcDir
-	cmd.Env = safeEnv(p.OS, p.Arch)
+	cmd.Env = c.safeEnv(p)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {

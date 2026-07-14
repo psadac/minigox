@@ -30,7 +30,7 @@ func TestMatchAny(t *testing.T) {
 		{nil, Platform{"linux", "amd64"}, false},
 	}
 	for _, tt := range tests {
-		got := matchAny(tt.patterns, tt.p)
+		got := matchAny(tt.p, tt.patterns)
 		if got != tt.want {
 			t.Errorf("matchAny(%v, %v) = %v, want %v", tt.patterns, tt.p, got, tt.want)
 		}
@@ -86,7 +86,11 @@ func TestFilterPlatforms(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := filterPlatforms(platforms, tt.include, tt.exclude)
+			c := &Config{
+				platformInclude: tt.include,
+				platformExclude: tt.exclude,
+			}
+			got := c.filterPlatforms(platforms)
 			if len(got) != len(tt.want) {
 				t.Fatalf("filterPlatforms() = %v (%d), want %v (%d)", got, len(got), tt.want, len(tt.want))
 			}
@@ -99,8 +103,28 @@ func TestFilterPlatforms(t *testing.T) {
 	}
 }
 
+func testConfig(t *testing.T, srcDir, outDir string) *Config {
+	t.Helper()
+	cache, err := goEnvCache("go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Config{
+		goCmd:   "go",
+		goCache: cache,
+		homeDir: "/home/test",
+		srcDir:  srcDir,
+		outDir:  outDir,
+		appName: filepath.Base(srcDir),
+	}
+}
+
 func TestSafeEnv(t *testing.T) {
-	env := safeEnv("linux", "arm64")
+	c := &Config{
+		goCache: "testcache",
+		homeDir: "/home/test",
+	}
+	env := c.safeEnv(Platform{OS: "linux", Arch: "arm64"})
 
 	checkEnv := func(key, val string) {
 		found := false
@@ -148,12 +172,6 @@ func TestNewConfig(t *testing.T) {
 	if c.appName != "notest" {
 		t.Errorf("appName = %q, want %q", c.appName, "notest")
 	}
-	if len(c.platforms) != 1 {
-		t.Fatalf("expected 1 platform, got %d", len(c.platforms))
-	}
-	if c.platforms[0] != (Platform{"linux", "amd64"}) {
-		t.Errorf("platform = %v, want linux/amd64", c.platforms[0])
-	}
 }
 
 func TestNewConfig_InvalidSrcDir(t *testing.T) {
@@ -180,11 +198,7 @@ func TestBuildPlatform_AllCases(t *testing.T) {
 			outDir := t.TempDir()
 			appName := filepath.Base(tc.name)
 
-			c := &Config{
-				srcDir:  srcDir,
-				outDir:  outDir,
-				appName: appName,
-			}
+			c := testConfig(t, srcDir, outDir)
 
 			err := c.buildPlatform(Platform{OS: "linux", Arch: "amd64"})
 			if err != nil {
@@ -206,11 +220,7 @@ func TestBuildPlatform_Windows_AllCases(t *testing.T) {
 			outDir := t.TempDir()
 			appName := filepath.Base(name)
 
-			c := &Config{
-				srcDir:  srcDir,
-				outDir:  outDir,
-				appName: appName,
-			}
+			c := testConfig(t, srcDir, outDir)
 
 			err := c.buildPlatform(Platform{OS: "windows", Arch: "amd64"})
 			if err != nil {
