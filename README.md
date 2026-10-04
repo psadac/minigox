@@ -30,10 +30,14 @@ minigox -exclude "android/* */arm*"
 | `-out`     | `bin`    | Output directory for binaries                  |
 | `-include` | `*/*`    | Space-separated platform patterns to include   |
 | `-exclude` | `""`     | Space-separated platform patterns to exclude   |
+| `-workers` | auto    | Maximum number of concurrent builds           |
 
 Platform patterns use `filepath.Match` syntax (e.g. `linux/amd64`, `windows/*`,
 `*/*`, `*/arm*`). A malformed pattern is reported as an error rather than
 silently matching nothing.
+
+`-workers` defaults to `NumCPU-1`, with a floor of 2. Set it to `1` to build
+serially.
 
 ## How it works
 

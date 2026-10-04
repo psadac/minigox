@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -107,18 +108,17 @@ func TestFilterPlatforms(t *testing.T) {
 
 func testConfig(t *testing.T, srcDir, outDir string) *Config {
 	t.Helper()
-	cache, err := goEnvCache("go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &Config{
+	c := &Config{
 		goCmd:   "go",
-		goVars:  EnvVars{"GOCACHE": cache},
 		homeDir: "/home/test",
 		srcDir:  srcDir,
 		outDir:  outDir,
 		appName: filepath.Base(srcDir),
 	}
+	if err := c.getGoVars("GOCACHE"); err != nil {
+		t.Fatal(err)
+	}
+	return c
 }
 
 func TestSafeEnv(t *testing.T) {
@@ -207,7 +207,7 @@ func TestNewConfig(t *testing.T) {
 	srcDir := "testdata/cmd/notest"
 	outDir := filepath.Join(t.TempDir(), "bin")
 
-	c, err := NewConfig(srcDir, outDir, "linux/amd64", "")
+	c, err := NewConfig(Options{SrcDir: srcDir, OutDir: outDir, Include: "linux/amd64"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,10 +219,32 @@ func TestNewConfig(t *testing.T) {
 	if c.appName != "notest" {
 		t.Errorf("appName = %q, want %q", c.appName, "notest")
 	}
+	if c.maxWorkers < 2 {
+		t.Errorf("maxWorkers = %d, want at least 2 when auto-detected", c.maxWorkers)
+	}
+}
+
+func TestNewConfig_Workers(t *testing.T) {
+	srcDir := "testdata/cmd/notest"
+
+	c, err := NewConfig(Options{SrcDir: srcDir, OutDir: t.TempDir(), Workers: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.maxWorkers != 7 {
+		t.Errorf("maxWorkers = %d, want 7", c.maxWorkers)
+	}
+}
+
+func TestNewConfig_NegativeWorkers(t *testing.T) {
+	_, err := NewConfig(Options{SrcDir: "testdata/cmd/notest", OutDir: t.TempDir(), Workers: -1})
+	if err == nil {
+		t.Fatal("expected error for negative worker count")
+	}
 }
 
 func TestNewConfig_InvalidSrcDir(t *testing.T) {
-	_, err := NewConfig("/nonexistent/path", t.TempDir(), "*/*", "")
+	_, err := NewConfig(Options{SrcDir: "/nonexistent/path", OutDir: t.TempDir()})
 	if err == nil {
 		t.Fatal("expected error for invalid source directory")
 	}
@@ -252,7 +274,7 @@ func TestValidatePatterns(t *testing.T) {
 }
 
 func TestNewConfig_InvalidPattern(t *testing.T) {
-	_, err := NewConfig("testdata/cmd/notest", t.TempDir(), "linux/[amd64", "")
+	_, err := NewConfig(Options{SrcDir: "testdata/cmd/notest", OutDir: t.TempDir(), Include: "linux/[amd64"})
 	if err == nil {
 		t.Fatal("expected error for malformed include pattern")
 	}
@@ -316,17 +338,21 @@ func TestBuildAll_IncludesSuccess(t *testing.T) {
 	srcDir := "testdata/cmd/withtest"
 	outDir := t.TempDir()
 
-	c, err := NewConfig(srcDir, outDir, "linux/amd64 windows/amd64", "")
+	c, err := NewConfig(Options{SrcDir: srcDir, OutDir: outDir, Include: "linux/amd64 windows/amd64"})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	err = c.buildAll()
+	res, err := c.buildAll()
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	for _, p := range c.platforms {
+	if res.Platforms != 2 || res.OK != 2 || res.Skipped != 0 || res.Failed != 0 {
+		t.Errorf("result = %+v, want 2 platforms all ok", res)
+	}
+
+	for _, p := range c.filterPlatforms(c.platformsFromToolchain(t)) {
 		ext := ""
 		if p.OS == "windows" {
 			ext = ".exe"
@@ -334,6 +360,100 @@ func TestBuildAll_IncludesSuccess(t *testing.T) {
 		binPath := filepath.Join(outDir, "withtest"+"-"+p.OS+"-"+p.Arch+ext)
 		if _, err := os.Stat(binPath); os.IsNotExist(err) {
 			t.Fatalf("expected binary at %s", binPath)
+		}
+	}
+}
+
+// platformsFromToolchain returns the platforms matching the config's filters,
+// so tests can assert on the binaries a run should have produced.
+func (c *Config) platformsFromToolchain(t *testing.T) []Platform {
+	t.Helper()
+	all, err := c.listPlatforms()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c.filterPlatforms(all)
+}
+
+func TestBuildAll_ReportsFailures(t *testing.T) {
+	outDir := t.TempDir()
+
+	// A source directory that cannot compile gives a genuine per-platform
+	// failure, which must be reported as a *BuildError and counted.
+	broken := t.TempDir()
+	if err := os.WriteFile(filepath.Join(broken, "main.go"), []byte("package main\nfunc main() { nope() }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := NewConfig(Options{SrcDir: broken, OutDir: outDir, Include: "linux/amd64 darwin/amd64", Workers: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, buildErr := c.buildAll()
+	if buildErr == nil {
+		t.Fatal("expected an error for a source directory that does not compile")
+	}
+
+	var be *BuildError
+	if !errors.As(buildErr, &be) {
+		t.Fatalf("error = %T (%v), want *BuildError", buildErr, buildErr)
+	}
+	if len(be.Platforms) != 2 {
+		t.Errorf("BuildError.Platforms = %d, want 2", len(be.Platforms))
+	}
+	for _, pe := range be.Platforms {
+		if pe.Err == nil {
+			t.Errorf("PlatformError for %s has a nil Err", pe.Platform)
+		}
+	}
+
+	if res.Failed != 2 || res.OK != 0 {
+		t.Errorf("result = %+v, want 2 failures", res)
+	}
+}
+
+func TestBuildAll_CGOPlatformsAreSkipped(t *testing.T) {
+	c, err := NewConfig(Options{SrcDir: "testdata/cmd/notest", OutDir: t.TempDir(), Include: "linux/amd64 ios/arm64", Workers: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, buildErr := c.buildAll()
+	if buildErr != nil {
+		t.Fatalf("buildAll() = %v, want nil (ios should be skipped, not fatal)", buildErr)
+	}
+	if res.Skipped != 1 {
+		t.Errorf("result.Skipped = %d, want 1", res.Skipped)
+	}
+	if res.OK != 1 || res.Failed != 0 {
+		t.Errorf("result = %+v, want 1 ok and no failures", res)
+	}
+}
+
+func TestBuildError_Error(t *testing.T) {
+	one := &BuildError{Platforms: []PlatformError{{Platform: Platform{OS: "linux", Arch: "amd64"}}}}
+	if got := one.Error(); got != "build failed for 1 platform: linux/amd64" {
+		t.Errorf("Error() = %q", got)
+	}
+
+	many := &BuildError{Platforms: []PlatformError{
+		{Platform: Platform{OS: "linux", Arch: "amd64"}},
+		{Platform: Platform{OS: "darwin", Arch: "arm64"}},
+	}}
+	if got := many.Error(); got != "build failed for 2 platforms" {
+		t.Errorf("Error() = %q", got)
+	}
+}
+
+func TestEnvVars_StringArrayIsSorted(t *testing.T) {
+	ev := EnvVars{"GOMODCACHE": "/mod", "GOCACHE": "/cache", "GOFLAGS": ""}
+
+	want := []string{"GOCACHE=/cache", "GOFLAGS=", "GOMODCACHE=/mod"}
+	for range 20 {
+		got := ev.StringArray()
+		if !slices.Equal(got, want) {
+			t.Fatalf("StringArray() = %v, want %v", got, want)
 		}
 	}
 }

@@ -9,19 +9,26 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 )
 
 // EnvVars represents a collection of environment variables as key-value pairs.
 type EnvVars map[string]string
 
-func (ev *EnvVars) StringArray() []string {
-	sa := make([]string, 0, len(*ev))
+// StringArray returns the variables as KEY=VALUE strings, sorted by key so that
+// the result is deterministic.
+func (ev EnvVars) StringArray() []string {
+	keys := make([]string, 0, len(ev))
+	for k := range ev {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
 
-	for k, v := range *ev {
-		sa = append(sa, k+"="+v)
+	sa := make([]string, 0, len(ev))
+	for _, k := range keys {
+		sa = append(sa, k+"="+ev[k])
 	}
 
 	return sa
@@ -38,7 +45,18 @@ func (p Platform) String() string {
 	return p.OS + "/" + p.Arch
 }
 
-// Config holds the configuration for a cross-compilation run.
+// Options describes a cross-compilation run as requested by the user.
+type Options struct {
+	SrcDir  string
+	OutDir  string
+	Include string
+	Exclude string
+	// Workers caps the number of concurrent builds. Zero means auto-detect.
+	Workers int
+}
+
+// Config holds the validated configuration for a cross-compilation run. It is
+// immutable once returned by NewConfig; per-run state is reported by Result.
 type Config struct {
 	goCmd           string
 	goVars          EnvVars
@@ -48,15 +66,20 @@ type Config struct {
 	appName         string
 	platformInclude string
 	platformExclude string
-	platforms       []Platform
 	maxWorkers      int
-	nbErrors        atomic.Uint32
-	nbSkipped       atomic.Uint32
 }
 
-// NewConfig builds a Config, validating directories and selecting platforms
-// from include/exclude patterns.
-func NewConfig(srcDir, outDir, platformInclude, platformExclude string) (*Config, error) {
+// NewConfig validates opts and returns the configuration for a
+// cross-compilation run.
+func NewConfig(opts Options) (*Config, error) {
+	if opts.Workers < 0 {
+		return nil, fmt.Errorf("-workers must be positive, got %d", opts.Workers)
+	}
+
+	if err := validatePatterns(opts.Include, opts.Exclude); err != nil {
+		return nil, err
+	}
+
 	goCmd, err := exec.LookPath("go")
 	if err != nil {
 		return nil, fmt.Errorf("go binary not found in PATH: %w", err)
@@ -70,7 +93,7 @@ func NewConfig(srcDir, outDir, platformInclude, platformExclude string) (*Config
 		return nil, err
 	}
 
-	absSrcDir, err := filepath.Abs(srcDir)
+	absSrcDir, err := filepath.Abs(opts.SrcDir)
 	if err != nil {
 		return nil, err
 	}
@@ -80,9 +103,14 @@ func NewConfig(srcDir, outDir, platformInclude, platformExclude string) (*Config
 		return nil, fmt.Errorf("source directory %q: %w", absSrcDir, err)
 	}
 
-	absOutDir, err := filepath.Abs(outDir)
+	absOutDir, err := filepath.Abs(opts.OutDir)
 	if err != nil {
 		return nil, err
+	}
+
+	maxWorkers := opts.Workers
+	if maxWorkers == 0 {
+		maxWorkers = max(2, runtime.NumCPU()-1)
 	}
 
 	c := &Config{
@@ -91,19 +119,12 @@ func NewConfig(srcDir, outDir, platformInclude, platformExclude string) (*Config
 		srcDir:          absSrcDir,
 		outDir:          absOutDir,
 		appName:         filepath.Base(absSrcDir),
-		platformInclude: platformInclude,
-		platformExclude: platformExclude,
-		maxWorkers:      max(2, runtime.NumCPU()-1),
-		nbErrors:        atomic.Uint32{},
+		platformInclude: opts.Include,
+		platformExclude: opts.Exclude,
+		maxWorkers:      maxWorkers,
 	}
 
-	err = validatePatterns(platformInclude, platformExclude)
-	if err != nil {
-		return nil, err
-	}
-
-	err = c.getGoVars("GOCACHE", "GOMODCACHE")
-	if err != nil {
+	if err := c.getGoVars("GOCACHE", "GOMODCACHE"); err != nil {
 		return nil, fmt.Errorf("failed to determine go env variables: %w", err)
 	}
 
@@ -181,65 +202,115 @@ func validatePatterns(include, exclude string) error {
 	return nil
 }
 
-func (c *Config) String() string {
+// Result summarizes the outcome of a cross-compilation run.
+type Result struct {
+	Platforms int
+	OK        int
+	Skipped   int
+	Failed    int
+}
+
+// PlatformError records why a single platform failed to build.
+type PlatformError struct {
+	Platform Platform
+	Err      error
+}
+
+// BuildError reports the platforms that could not be built. The underlying
+// errors have already been reported to stderr as they happened; this type lets
+// callers inspect them programmatically.
+type BuildError struct {
+	Platforms []PlatformError
+}
+
+func (e *BuildError) Error() string {
+	if len(e.Platforms) == 1 {
+		return fmt.Sprintf("build failed for 1 platform: %s", e.Platforms[0].Platform)
+	}
+
+	return fmt.Sprintf("build failed for %d platforms", len(e.Platforms))
+}
+
+// summary describes the effective configuration for a run.
+func (c *Config) summary(platforms []Platform) string {
 	return fmt.Sprintf(`
   Source dir : %s
   Output dir : %s
   Platforms  : %d
   Workers    : %d
   Go vars    : %v
-`, c.srcDir, c.outDir, len(c.platforms), c.maxWorkers, c.goVars.StringArray())
+`, c.srcDir, c.outDir, len(platforms), c.maxWorkers, c.goVars.StringArray())
 }
 
-// buildAll cross-compiles for all configured platforms in parallel.
-func (c *Config) buildAll() error {
-	err := os.MkdirAll(c.outDir, 0o755)
-	if err != nil {
-		return fmt.Errorf("cannot create output directory: %w", err)
+// buildAll cross-compiles for all matching platforms in parallel. It always
+// returns a Result, even when some platforms fail; failures are additionally
+// reported as a *BuildError.
+func (c *Config) buildAll() (*Result, error) {
+	if err := os.MkdirAll(c.outDir, 0o755); err != nil {
+		return nil, fmt.Errorf("cannot create output directory: %w", err)
 	}
 
-	ps, err := c.listPlatforms()
+	all, err := c.listPlatforms()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	c.platforms = c.filterPlatforms(ps)
+	platforms := c.filterPlatforms(all)
 
 	fmt.Printf(`
 Configuration:
 %s
 Starting cross-compilation:
 
-`, c.String())
+`, c.summary(platforms))
 
-	workersCh := make(chan struct{}, c.maxWorkers)
+	var (
+		mu       sync.Mutex
+		failures []PlatformError
+		nOK      int
+		nSkip    int
+	)
+
+	jobs := make(chan Platform)
+
 	var wg sync.WaitGroup
-
-	for _, p := range c.platforms {
+	for range c.maxWorkers {
 		wg.Add(1)
-		go func(p Platform) {
+		go func() {
 			defer wg.Done()
-			workersCh <- struct{}{}
-			defer func() { <-workersCh }()
+			for p := range jobs {
+				err := c.buildPlatform(p)
 
-			err := c.buildPlatform(p)
-			switch {
-			case err == nil:
-				fmt.Printf("  ok    - %-18s\n", p.String())
-			case errors.Is(err, errCGORequired):
-				fmt.Printf("  skip  - %-18s - requires cgo\n", p.String())
-				c.nbSkipped.Add(1)
-			default:
-				fmt.Fprintf(os.Stderr, "  error - %-18s - %v\n", p.String(), err)
-				c.nbErrors.Add(1)
+				mu.Lock()
+				switch {
+				case err == nil:
+					nOK++
+					fmt.Printf("  ok    - %-18s\n", p)
+				case errors.Is(err, errCGORequired):
+					nSkip++
+					fmt.Printf("  skip  - %-18s - requires cgo\n", p)
+				default:
+					failures = append(failures, PlatformError{Platform: p, Err: err})
+					fmt.Fprintf(os.Stderr, "  error - %-18s - %v\n", p, err)
+				}
+				mu.Unlock()
 			}
-		}(p)
+		}()
 	}
 
+	for _, p := range platforms {
+		jobs <- p
+	}
+	close(jobs)
 	wg.Wait()
 
-	nErrors := int(c.nbErrors.Load())
-	nSkipped := int(c.nbSkipped.Load())
+	res := &Result{
+		Platforms: len(platforms),
+		OK:        nOK,
+		Skipped:   nSkip,
+		Failed:    len(failures),
+	}
+
 	fmt.Printf(`
 Results:
 
@@ -247,13 +318,13 @@ Results:
   skipped : %d
   errors  : %d
 
-`, len(c.platforms)-nErrors-nSkipped, nSkipped, nErrors)
+`, res.OK, res.Skipped, res.Failed)
 
-	if nErrors > 0 {
-		return fmt.Errorf("build finished with %d errors", nErrors)
+	if len(failures) > 0 {
+		return res, &BuildError{Platforms: failures}
 	}
 
-	return nil
+	return res, nil
 }
 
 // getGoVars retrieves Go environment variables in JSON format, parses them, and updates the Config with relevant values.
@@ -279,14 +350,6 @@ func (c *Config) getGoVars(keys ...string) error {
 	}
 
 	return nil
-}
-
-func goEnvCache(goCmd string) (string, error) {
-	out, err := exec.Command(goCmd, "env", "GOCACHE").Output()
-	if err != nil {
-		return "", fmt.Errorf("failed running go env GOCACHE: %w", err)
-	}
-	return strings.TrimRight(string(out), "\n"), nil
 }
 
 // safeEnv returns a minimal environment for the build command, passing through
@@ -408,6 +471,7 @@ func main() {
 	outputDir := flag.String("out", "bin", "Output directory for binaries")
 	platformInclude := flag.String("include", "*/*", "Space-separated platform patterns to include (e.g. 'linux/amd64 windows/*')")
 	platformExclude := flag.String("exclude", "", "Space-separated platform patterns to exclude (e.g. 'openbsd/* */arm')")
+	workers := flag.Int("workers", 0, "Maximum number of concurrent builds (default: NumCPU-1, minimum 2)")
 
 	flag.Usage = func() {
 		name := filepath.Base(os.Args[0])
@@ -432,14 +496,19 @@ func main() {
 		srcDir = flag.Arg(0)
 	}
 
-	c, err := NewConfig(srcDir, *outputDir, *platformInclude, *platformExclude)
+	c, err := NewConfig(Options{
+		SrcDir:  srcDir,
+		OutDir:  *outputDir,
+		Include: *platformInclude,
+		Exclude: *platformExclude,
+		Workers: *workers,
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
-	err = c.buildAll()
-	if err != nil {
+	if _, err := c.buildAll(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
