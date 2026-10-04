@@ -53,6 +53,30 @@ source directory. Two projects sharing a directory name will overwrite each
 other if pointed at the same `-out` directory; use separate output directories
 in that case.
 
+### Build environment
+
+Each build gets a sanitised environment. `PATH` and `HOME` are inherited,
+`CGO_ENABLED=0` plus the target `GOOS`/`GOARCH` are set explicitly, and
+`GOTOOLCHAIN=local` pins the toolchain. Variables that would change build
+behaviour are dropped so they cannot be injected from the parent environment:
+
+| Passed through         | Dropped                                     |
+|------------------------|---------------------------------------------|
+| `GOCACHE`, `GOMODCACHE` | `GOFLAGS`, `GOEXPERIMENT`, `GOPROXY`, `GOPATH` |
+
+`GOCACHE` and `GOMODCACHE` only affect *where* the toolchain reads
+already-fetched artifacts, so they are preserved to support projects using
+non-default caches. Behaviour-changing variables are not.
+
+Two consequences worth knowing:
+
+- Builds are **not offline**. With `GOPROXY` unset the toolchain falls back to
+  its default proxy for modules missing from the cache.
+- If `go.mod` requires a newer Go than the one on `PATH`, the build fails with
+  `go.mod requires go >= X (running go Y; GOTOOLCHAIN=local)` instead of
+  silently downloading a different toolchain. Install a newer `go` on `PATH` to
+  cross-compile such a project.
+
 minigox is inspired by [gox](https://github.com/mitchellh/gox).
 
 ## License
