@@ -57,11 +57,11 @@ type Config struct {
 func NewConfig(srcDir, outDir, platformInclude, platformExclude string) (*Config, error) {
 	goCmd, err := exec.LookPath("go")
 	if err != nil {
-		return nil, fmt.Errorf("error: go binary not found in PATH: %v\n", err)
+		return nil, fmt.Errorf("go binary not found in PATH: %w", err)
 	}
 	goCmd, err = filepath.Abs(goCmd)
 	if err != nil {
-		return nil, fmt.Errorf("error: cannot resolve go binary path: %v\n", err)
+		return nil, fmt.Errorf("cannot resolve go binary path: %w", err)
 	}
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -95,9 +95,14 @@ func NewConfig(srcDir, outDir, platformInclude, platformExclude string) (*Config
 		nbErrors:        atomic.Uint32{},
 	}
 
+	err = validatePatterns(platformInclude, platformExclude)
+	if err != nil {
+		return nil, err
+	}
+
 	err = c.getGoVars("GOCACHE", "GOVERSION")
 	if err != nil {
-		return nil, fmt.Errorf("error: failed to determine go env variables: %v\n", err)
+		return nil, fmt.Errorf("failed to determine go env variables: %w", err)
 	}
 
 	return c, nil
@@ -152,6 +157,26 @@ func matchAny(p Platform, patterns []string) bool {
 	}
 
 	return false
+}
+
+// validatePatterns reports malformed include/exclude patterns instead of
+// letting them silently match nothing.
+func validatePatterns(include, exclude string) error {
+	for _, set := range []struct {
+		flag string
+		raw  string
+	}{
+		{"include", include},
+		{"exclude", exclude},
+	} {
+		for _, pat := range strings.Fields(set.raw) {
+			if _, err := filepath.Match(pat, "os/arch"); err != nil {
+				return fmt.Errorf("invalid -%s pattern %q: %w", set.flag, pat, err)
+			}
+		}
+	}
+
+	return nil
 }
 
 func (c *Config) String() string {
@@ -299,7 +324,7 @@ func (c *Config) buildPlatform(p Platform) error {
 const usageText = `Usage: %s [options] [path]
 
   %s cross-compiles Go applications in parallel for all operating systems and architectures.
-  The last positional argument is used as the source directory (defaults to ".").
+  The optional positional argument is the source directory (defaults to ".").
 
 Flags:
 `
@@ -321,9 +346,15 @@ func main() {
 
 	flag.Parse()
 
+	if flag.NArg() > 1 {
+		fmt.Fprintf(os.Stderr, "error: expected at most one source directory, got %d\n\n", flag.NArg())
+		flag.Usage()
+		os.Exit(2)
+	}
+
 	srcDir := "."
-	if flag.NArg() > 0 {
-		srcDir = flag.Arg(flag.NArg() - 1)
+	if flag.NArg() == 1 {
+		srcDir = flag.Arg(0)
 	}
 
 	c, err := NewConfig(srcDir, *outputDir, *platformInclude, *platformExclude)

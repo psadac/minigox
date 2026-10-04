@@ -181,6 +181,36 @@ func TestNewConfig_InvalidSrcDir(t *testing.T) {
 	}
 }
 
+func TestValidatePatterns(t *testing.T) {
+	tests := []struct {
+		name    string
+		include string
+		exclude string
+		wantErr bool
+	}{
+		{name: "valid patterns", include: "linux/amd64 windows/*", exclude: "*/arm"},
+		{name: "empty patterns", include: "", exclude: ""},
+		{name: "unterminated class in include", include: "linux/[amd64", wantErr: true},
+		{name: "unterminated class in exclude", exclude: "[", wantErr: true},
+		{name: "valid alongside invalid", include: "linux/amd64 bad[", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validatePatterns(tt.include, tt.exclude)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validatePatterns(%q, %q) error = %v, wantErr %v", tt.include, tt.exclude, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNewConfig_InvalidPattern(t *testing.T) {
+	_, err := NewConfig("testdata/cmd/notest", t.TempDir(), "linux/[amd64", "")
+	if err == nil {
+		t.Fatal("expected error for malformed include pattern")
+	}
+}
+
 func TestBuildPlatform_AllCases(t *testing.T) {
 	cases := []struct {
 		name   string // relative to testdata/
