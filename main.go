@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -50,6 +51,7 @@ type Config struct {
 	platforms       []Platform
 	maxWorkers      int
 	nbErrors        atomic.Uint32
+	nbSkipped       atomic.Uint32
 }
 
 // NewConfig builds a Config, validating directories and selecting platforms
@@ -221,28 +223,34 @@ Starting cross-compilation:
 			defer func() { <-workersCh }()
 
 			err := c.buildPlatform(p)
-			if err != nil {
+			switch {
+			case err == nil:
+				fmt.Printf("  ok    - %-18s\n", p.String())
+			case errors.Is(err, errCGORequired):
+				fmt.Printf("  skip  - %-18s - requires cgo\n", p.String())
+				c.nbSkipped.Add(1)
+			default:
 				fmt.Fprintf(os.Stderr, "  error - %-18s - %v\n", p.String(), err)
 				c.nbErrors.Add(1)
-			} else {
-				fmt.Printf("  ok    - %-18s\n", p.String())
 			}
 		}(p)
 	}
 
 	wg.Wait()
 
-	n := int(c.nbErrors.Load())
+	nErrors := int(c.nbErrors.Load())
+	nSkipped := int(c.nbSkipped.Load())
 	fmt.Printf(`
 Results:
 
-  ok     : %d
-  errors : %d
+  ok      : %d
+  skipped : %d
+  errors  : %d
 
-`, len(c.platforms)-n, n)
+`, len(c.platforms)-nErrors-nSkipped, nSkipped, nErrors)
 
-	if n > 0 {
-		return fmt.Errorf("build finished with %d errors", n)
+	if nErrors > 0 {
+		return fmt.Errorf("build finished with %d errors", nErrors)
 	}
 
 	return nil
@@ -296,6 +304,37 @@ func (c *Config) safeEnv(p Platform) []string {
 	return env
 }
 
+// errCGORequired marks a platform the Go toolchain cannot build with
+// CGO_ENABLED=0, such as android/* and ios/*. These are reported as skipped
+// rather than as build failures, since they are not fixable by the caller.
+var errCGORequired = errors.New("platform requires cgo")
+
+// requiresCGO reports whether a failed build was caused by the target platform
+// needing cgo rather than by a genuine compilation error.
+func requiresCGO(msg string) bool {
+	return strings.Contains(msg, "requires external (cgo) linking") ||
+		strings.Contains(msg, "requires cgo") ||
+		strings.Contains(msg, "cgo is not enabled")
+}
+
+// checkOutputPath rejects an output path that already exists but is not a
+// regular file, so a symlink, directory or device node in the output directory
+// is never silently written through or replaced.
+func checkOutputPath(path string) error {
+	fi, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("cannot inspect output path %q: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("output path %q exists and is not a regular file (mode %s)", path, fi.Mode())
+	}
+
+	return nil
+}
+
 // buildPlatform compiles the app for p and writes the binary to the output dir.
 func (c *Config) buildPlatform(p Platform) error {
 	ext := ""
@@ -305,17 +344,38 @@ func (c *Config) buildPlatform(p Platform) error {
 
 	outputPath := filepath.Join(c.outDir, fmt.Sprintf("%s-%s-%s%s", c.appName, p.OS, p.Arch, ext))
 
-	cmd := exec.Command(c.goCmd, "build", "-o", outputPath, ".")
+	if err := checkOutputPath(outputPath); err != nil {
+		return err
+	}
+
+	// Build into a temporary file in the output directory and rename it into
+	// place, so an interrupted build cannot leave a truncated binary behind.
+	tmp, err := os.CreateTemp(c.outDir, c.appName+"-*.tmp")
+	if err != nil {
+		return fmt.Errorf("cannot create temporary file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath)
+
+	cmd := exec.Command(c.goCmd, "build", "-o", tmpPath, ".")
 	cmd.Dir = c.srcDir
 	cmd.Env = c.safeEnv(p)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimRight(string(out), "\n")
+		if requiresCGO(msg) {
+			return errCGORequired
+		}
 		if msg == "" {
 			return err
 		}
 		return fmt.Errorf("%s: %w", msg, err)
+	}
+
+	if err := os.Rename(tmpPath, outputPath); err != nil {
+		return fmt.Errorf("cannot write %q: %w", outputPath, err)
 	}
 
 	return nil

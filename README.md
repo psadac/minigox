@@ -26,13 +26,14 @@ minigox -exclude "android/* */arm*"
 
 | Flag       | Default  | Description                                    |
 |------------|----------|------------------------------------------------|
-| `<path>`   | `.`      | Last positional argument; directory of the Go code/package to compile |
+| `<path>`   | `.`      | Optional positional argument; directory of the Go code/package to compile |
 | `-out`     | `bin`    | Output directory for binaries                  |
 | `-include` | `*/*`    | Space-separated platform patterns to include   |
 | `-exclude` | `""`     | Space-separated platform patterns to exclude   |
 
 Platform patterns use `filepath.Match` syntax (e.g. `linux/amd64`, `windows/*`,
-`*/*`, `*/arm*`).
+`*/*`, `*/arm*`). A malformed pattern is reported as an error rather than
+silently matching nothing.
 
 ## How it works
 
@@ -40,7 +41,17 @@ Platform patterns use `filepath.Match` syntax (e.g. `linux/amd64`, `windows/*`,
 2. Applies include/exclude filters.
 3. Cross-compiles every remaining platform in parallel using a worker pool.
 4. Each build runs in a sanitised environment (`CGO_ENABLED=0`, explicit
-   `GOOS`/`GOARCH`, no leaked variables).
+   `GOOS`/`GOARCH`, no leaked variables), writing to a temporary file that is
+   renamed into place so an interrupted build never leaves a truncated binary.
+
+Platforms that cannot be built without cgo (`android/*`, `ios/*`) are reported
+as `skip` rather than as errors, and do not affect the exit status. Genuine
+compilation failures are reported as `error` and exit non-zero.
+
+Binaries are named `<app>-<os>-<arch>`, where `<app>` is the base name of the
+source directory. Two projects sharing a directory name will overwrite each
+other if pointed at the same `-out` directory; use separate output directories
+in that case.
 
 minigox is inspired by [gox](https://github.com/mitchellh/gox).
 

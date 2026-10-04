@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -288,5 +290,186 @@ func TestBuildAll_IncludesSuccess(t *testing.T) {
 		if _, err := os.Stat(binPath); os.IsNotExist(err) {
 			t.Fatalf("expected binary at %s", binPath)
 		}
+	}
+}
+
+func TestRequiresCGO(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  string
+		want bool
+	}{
+		{
+			name: "external linking",
+			msg:  "warning: something\nandroid/amd64 requires external (cgo) linking, but cgo is not enabled: exit status 1",
+			want: true,
+		},
+		{
+			name: "default PIE binary",
+			msg:  "default PIE binary requires external (cgo) linking, but cgo is not enabled: exit status 1",
+			want: true,
+		},
+		{
+			name: "requires cgo",
+			msg:  "ios/arm64 requires cgo",
+			want: true,
+		},
+		{
+			name: "compile error",
+			msg:  "./main.go:10:2: undefined: nope",
+			want: false,
+		},
+		{
+			name: "empty",
+			msg:  "",
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := requiresCGO(tt.msg); got != tt.want {
+				t.Errorf("requiresCGO(%q) = %v, want %v", tt.msg, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCheckOutputPath_Missing(t *testing.T) {
+	if err := checkOutputPath(filepath.Join(t.TempDir(), "nope")); err != nil {
+		t.Fatalf("checkOutputPath on missing path = %v, want nil", err)
+	}
+}
+
+func TestCheckOutputPath_ExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bin")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkOutputPath(path); err != nil {
+		t.Fatalf("checkOutputPath on regular file = %v, want nil", err)
+	}
+}
+
+func TestCheckOutputPath_Directory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bin")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkOutputPath(path); err == nil {
+		t.Fatal("expected error for directory at output path")
+	}
+}
+
+func TestCheckOutputPath_Symlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires elevation on Windows")
+	}
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(target, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := checkOutputPath(link); err == nil {
+		t.Fatal("expected error for symlink at output path")
+	}
+
+	// The link target must be left untouched.
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "x" {
+		t.Fatalf("symlink target modified: %q", data)
+	}
+}
+
+func TestBuildPlatform_RefusesSymlinkOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires elevation on Windows")
+	}
+
+	srcDir := filepath.Join("testdata", "cmd", "notest")
+	outDir := t.TempDir()
+	appName := filepath.Base(srcDir)
+
+	victim := filepath.Join(outDir, "victim")
+	if err := os.WriteFile(victim, []byte("do not touch"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(outDir, appName+"-linux-amd64")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatal(err)
+	}
+
+	c := testConfig(t, srcDir, outDir)
+	err := c.buildPlatform(Platform{OS: "linux", Arch: "amd64"})
+	if err == nil {
+		t.Fatal("expected error when output path is a symlink")
+	}
+
+	data, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "do not touch" {
+		t.Fatalf("symlink target was overwritten: %q", data)
+	}
+}
+
+func TestBuildPlatform_NoLeftoverTempFiles(t *testing.T) {
+	srcDir := filepath.Join("testdata", "cmd", "notest")
+	outDir := t.TempDir()
+
+	c := testConfig(t, srcDir, outDir)
+	if err := c.buildPlatform(Platform{OS: "linux", Arch: "amd64"}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("temporary build artifact left behind: %s", e.Name())
+		}
+	}
+	if len(entries) != 1 {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Errorf("output dir = %v, want exactly one binary", names)
+	}
+}
+
+func TestBuildPlatform_CGORequiredIsNotAnError(t *testing.T) {
+	srcDir := filepath.Join("testdata", "cmd", "notest")
+	outDir := t.TempDir()
+
+	c := testConfig(t, srcDir, outDir)
+
+	err := c.buildPlatform(Platform{OS: "ios", Arch: "arm64"})
+	if err == nil {
+		t.Skip("toolchain can build ios/arm64 without cgo")
+	}
+	if !errors.Is(err, errCGORequired) {
+		t.Fatalf("buildPlatform(ios/arm64) = %v, want errCGORequired", err)
+	}
+
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("output dir = %d entries, want empty after cgo skip", len(entries))
 	}
 }
