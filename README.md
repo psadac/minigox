@@ -52,6 +52,11 @@ Platforms that cannot be built without cgo (`android/*`, `ios/*`) are reported
 as `skip` rather than as errors, and do not affect the exit status. Genuine
 compilation failures are reported as `error` and exit non-zero.
 
+`Ctrl-C` (or `SIGTERM`) interrupts a run: in-flight builds are killed, remaining
+platforms are not started, and the exit status is `130`. Binaries already
+written are kept — they are complete — and no partial files are left behind.
+Interrupted builds are not counted as errors.
+
 Binaries are named `<app>-<os>-<arch>`, where `<app>` is the base name of the
 source directory. Two projects sharing a directory name will overwrite each
 other if pointed at the same `-out` directory; use separate output directories

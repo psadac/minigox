@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPlatformString(t *testing.T) {
@@ -299,7 +301,7 @@ func TestBuildPlatform_AllCases(t *testing.T) {
 
 			c := testConfig(t, srcDir, outDir)
 
-			err := c.buildPlatform(Platform{OS: "linux", Arch: "amd64"})
+			err := c.buildPlatform(t.Context(), Platform{OS: "linux", Arch: "amd64"})
 			if err != nil {
 				t.Fatalf("buildPlatform: %v", err)
 			}
@@ -321,7 +323,7 @@ func TestBuildPlatform_Windows_AllCases(t *testing.T) {
 
 			c := testConfig(t, srcDir, outDir)
 
-			err := c.buildPlatform(Platform{OS: "windows", Arch: "amd64"})
+			err := c.buildPlatform(t.Context(), Platform{OS: "windows", Arch: "amd64"})
 			if err != nil {
 				t.Fatalf("buildPlatform: %v", err)
 			}
@@ -343,7 +345,7 @@ func TestBuildAll_IncludesSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := c.buildAll()
+	res, err := c.buildAll(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +392,7 @@ func TestBuildAll_ReportsFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, buildErr := c.buildAll()
+	res, buildErr := c.buildAll(t.Context())
 	if buildErr == nil {
 		t.Fatal("expected an error for a source directory that does not compile")
 	}
@@ -419,7 +421,7 @@ func TestBuildAll_CGOPlatformsAreSkipped(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, buildErr := c.buildAll()
+	res, buildErr := c.buildAll(t.Context())
 	if buildErr != nil {
 		t.Fatalf("buildAll() = %v, want nil (ios should be skipped, not fatal)", buildErr)
 	}
@@ -429,6 +431,116 @@ func TestBuildAll_CGOPlatformsAreSkipped(t *testing.T) {
 	if res.OK != 1 || res.Failed != 0 {
 		t.Errorf("result = %+v, want 1 ok and no failures", res)
 	}
+}
+
+func TestBuildAll_CancelledBeforeStart(t *testing.T) {
+	c, err := NewConfig(Options{SrcDir: "testdata/cmd/notest", OutDir: t.TempDir(), Include: "*/*", Workers: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	res, buildErr := c.buildAll(ctx)
+	if !errors.Is(buildErr, context.Canceled) {
+		t.Fatalf("buildAll() error = %v, want context.Canceled", buildErr)
+	}
+
+	var be *BuildError
+	if errors.As(buildErr, &be) {
+		t.Error("cancellation must not be reported as a BuildError")
+	}
+	if res.Failed != 0 {
+		t.Errorf("result.Failed = %d, want 0: killed builds are not failures", res.Failed)
+	}
+	if res.Platforms == 0 || res.OK+res.Skipped+res.Failed+res.Unstarted != res.Platforms {
+		t.Errorf("result = %+v, do not want the platform counts to add up", res)
+	}
+}
+
+func TestBuildAll_CancelledMidRun(t *testing.T) {
+	outDir := t.TempDir()
+
+	c, err := NewConfig(Options{SrcDir: "testdata/cmd/notest", OutDir: outDir, Include: "*/*", Workers: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	// Cancel once the first build has landed, so the run is interrupted
+	// mid-flight rather than up front.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			entries, err := os.ReadDir(outDir)
+			if err == nil && len(entries) > 0 {
+				cancel()
+				return
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	start := time.Now()
+	res, buildErr := c.buildAll(ctx)
+	<-done
+
+	if !errors.Is(buildErr, context.Canceled) {
+		t.Fatalf("buildAll() error = %v, want context.Canceled", buildErr)
+	}
+	if res.Failed != 0 {
+		t.Errorf("result.Failed = %d, want 0: killed builds are not failures", res.Failed)
+	}
+
+	// A cancelled run must still leave no partial binaries or temp files.
+	for _, name := range mustReadDir(t, outDir) {
+		if strings.HasSuffix(name, ".tmp") {
+			t.Errorf("temporary build artifact left behind after cancel: %s", name)
+		}
+	}
+
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Errorf("buildAll took %s after cancellation, expected a prompt return", elapsed)
+	}
+}
+
+func TestBuildPlatform_RespectsCancelledContext(t *testing.T) {
+	srcDir := filepath.Join("testdata", "cmd", "notest")
+	outDir := t.TempDir()
+
+	c := testConfig(t, srcDir, outDir)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err := c.buildPlatform(ctx, Platform{OS: "linux", Arch: "amd64"})
+	if err == nil {
+		t.Fatal("expected an error for a cancelled build")
+	}
+
+	entries := mustReadDir(t, outDir)
+	if len(entries) != 0 {
+		t.Errorf("output dir = %v, want empty: a cancelled build must not write a binary", entries)
+	}
+}
+
+func mustReadDir(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.Name()
+	}
+	return names
 }
 
 func TestBuildError_Error(t *testing.T) {
@@ -575,7 +687,7 @@ func TestBuildPlatform_RefusesSymlinkOutput(t *testing.T) {
 	}
 
 	c := testConfig(t, srcDir, outDir)
-	err := c.buildPlatform(Platform{OS: "linux", Arch: "amd64"})
+	err := c.buildPlatform(t.Context(), Platform{OS: "linux", Arch: "amd64"})
 	if err == nil {
 		t.Fatal("expected error when output path is a symlink")
 	}
@@ -594,7 +706,7 @@ func TestBuildPlatform_NoLeftoverTempFiles(t *testing.T) {
 	outDir := t.TempDir()
 
 	c := testConfig(t, srcDir, outDir)
-	if err := c.buildPlatform(Platform{OS: "linux", Arch: "amd64"}); err != nil {
+	if err := c.buildPlatform(t.Context(), Platform{OS: "linux", Arch: "amd64"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -622,7 +734,7 @@ func TestBuildPlatform_CGORequiredIsNotAnError(t *testing.T) {
 
 	c := testConfig(t, srcDir, outDir)
 
-	err := c.buildPlatform(Platform{OS: "ios", Arch: "arm64"})
+	err := c.buildPlatform(t.Context(), Platform{OS: "ios", Arch: "arm64"})
 	if err == nil {
 		t.Skip("toolchain can build ios/arm64 without cgo")
 	}
