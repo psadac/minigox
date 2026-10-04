@@ -31,6 +31,7 @@ minigox -exclude "android/* */arm*"
 | `-include` | `*/*`    | Space-separated platform patterns to include   |
 | `-exclude` | `""`     | Space-separated platform patterns to exclude   |
 | `-workers` | auto    | Maximum number of concurrent builds           |
+| `-version` | -       | Print version information and exit            |
 
 Platform patterns use `filepath.Match` syntax (e.g. `linux/amd64`, `windows/*`,
 `*/*`, `*/arm*`). A malformed pattern is reported as an error rather than
@@ -38,6 +39,30 @@ silently matching nothing.
 
 `-workers` defaults to `NumCPU-1`, with a floor of 2. Set it to `1` to build
 serially.
+
+## Versioning
+
+`minigox -version` prints the build version:
+
+```sh
+$ minigox -version
+minigox v1.0.0-9-gc6afdba-dirty go1.26.0 linux/amd64 commit c6afdba built 2026-10-04T11:49:35Z
+```
+
+Locally built binaries report `dev`. Releases are tagged `vX.Y.Z`, and the
+`Makefile` derives the version, commit, and build date from Git:
+
+```sh
+make build                 # injects git describe output
+make build VERSION=v1.2.3  # override the version
+make version               # print the version of a freshly built binary
+```
+
+The same values can be injected directly:
+
+```sh
+go build -ldflags "-X 'main.version=v1.2.3' -X 'main.commit=abc123'" .
+```
 
 ## How it works
 

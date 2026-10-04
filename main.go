@@ -24,6 +24,7 @@ func main() {
 	platformInclude := flag.String("include", "*/*", "Space-separated platform patterns to include (e.g. 'linux/amd64 windows/*')")
 	platformExclude := flag.String("exclude", "", "Space-separated platform patterns to exclude (e.g. 'openbsd/* */arm')")
 	workers := flag.Int("workers", 0, "Maximum number of concurrent builds (default: NumCPU-1, minimum 2)")
+	showVersion := flag.Bool("version", false, "Print version information and exit")
 
 	flag.Usage = func() {
 		name := filepath.Base(os.Args[0])
@@ -36,6 +37,11 @@ func main() {
 	}
 
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(versionString())
+		return
+	}
 
 	if flag.NArg() > 1 {
 		fmt.Fprintf(os.Stderr, "error: expected at most one source directory, got %d\n\n", flag.NArg())
