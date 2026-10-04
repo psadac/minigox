@@ -183,9 +183,7 @@ Starting cross-compilation:
 	)
 
 	for range c.maxWorkers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				select {
 				case <-ctx.Done():
@@ -197,7 +195,7 @@ Starting cross-compilation:
 					state.record(ctx, c.buildPlatform(ctx, p), p)
 				}
 			}
-		}()
+		})
 	}
 
 	var started int

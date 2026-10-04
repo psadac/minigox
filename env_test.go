@@ -27,13 +27,7 @@ func TestSafeEnv(t *testing.T) {
 
 	checkEnv := func(key, val string) {
 		t.Helper()
-		found := false
-		for _, e := range env {
-			if e == key+"="+val {
-				found = true
-				break
-			}
-		}
+		found := slices.Contains(env, key+"="+val)
 		if !found {
 			t.Errorf("safeEnv() missing %s=%s", key, val)
 		}

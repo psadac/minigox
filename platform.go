@@ -80,7 +80,7 @@ func validatePatterns(include, exclude string) error {
 		{"include", include},
 		{"exclude", exclude},
 	} {
-		for _, pat := range strings.Fields(set.raw) {
+		for pat := range strings.FieldsSeq(set.raw) {
 			if _, err := filepath.Match(pat, "os/arch"); err != nil {
 				return fmt.Errorf("invalid -%s pattern %q: %w", set.flag, pat, err)
 			}
